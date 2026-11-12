@@ -10,10 +10,12 @@ import urllib.parse
 import webbrowser
 
 from hexroute.config import load_config
+from hexroute.coverage import compute_coverage
 from hexroute.export import export_route_gpx, get_path_coordinates
 from hexroute.fetcher import sync_competition_targets
 from hexroute.graph import get_walking_graph
 from hexroute.grid import cell_to_boundary, cell_to_latlng, get_disk, latlng_to_cell
+from hexroute.ingest import ingest_activities
 from hexroute.optimise import plan_optimal_route
 from hexroute.targets import (
     HexStatus,
@@ -757,6 +759,14 @@ def get_ui_html() -> str:
             <div class="legend-color" style="background: #4361ee; height: 4px; border-radius: 2px;"></div>
             <span>Optimized Route Path</span>
         </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #3b82f6; opacity: 0.4;"></div>
+            <span>Visited (from ingested activities)</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #1d4ed8; height: 4px; border-radius: 2px;"></div>
+            <span>GPS Track</span>
+        </div>
     </div>
 </div>
 
@@ -781,6 +791,7 @@ def get_ui_html() -> str:
         await loadAppConfig();
         initMap();
         loadBackgroundTargets();
+        loadCoverage();
     });
 
     async function loadAppConfig() {
@@ -957,6 +968,61 @@ def get_ui_html() -> str:
         });
     }
 
+    let coverageLayerGroup;
+    let trackLayerGroup;
+
+    async function loadCoverage() {
+        try {
+            const res = await fetch("/api/coverage");
+            if (!res.ok) return;
+            const data = await res.json();
+            renderCoverage(data);
+        } catch (e) {
+            console.log("No coverage data:", e);
+        }
+    }
+
+    function renderCoverage(data) {
+        if (!data) return;
+        const coverage = data.coverage || [];
+        const tracks = data.tracks || [];
+        if (!coverage.length && !tracks.length) return;
+
+        if (coverageLayerGroup) map.removeLayer(coverageLayerGroup);
+        if (trackLayerGroup) map.removeLayer(trackLayerGroup);
+
+        coverageLayerGroup = L.featureGroup();
+        trackLayerGroup = L.featureGroup();
+
+        // Render covered hexes with a semi-transparent blue fill
+        coverage.forEach(c => {
+            const visits = c.visit_count || 1;
+            const opacity = Math.min(0.15 + visits * 0.08, 0.45);
+            const poly = L.polygon(c.boundary, {
+                color: "#3b82f6",
+                weight: 1,
+                fillColor: "#3b82f6",
+                fillOpacity: opacity
+            });
+            poly.bindTooltip(`<b>Visited Hex</b><br>Visits: ${visits}`);
+            coverageLayerGroup.addLayer(poly);
+        });
+
+        // Render raw GPS track polylines
+        tracks.forEach(t => {
+            if (t.coords && t.coords.length > 1) {
+                L.polyline(t.coords, {
+                    color: "#1d4ed8",
+                    weight: 2.5,
+                    opacity: 0.6
+                }).addTo(trackLayerGroup);
+            }
+        });
+
+        coverageLayerGroup.addTo(map);
+        trackLayerGroup.addTo(map);
+    }
+
     async function planRoute() {
         const planBtn = document.getElementById("plan-btn");
         const lat = parseFloat(document.getElementById("start-lat").value);
@@ -973,7 +1039,14 @@ def get_ui_html() -> str:
 
         planBtn.disabled = true;
         planBtn.innerHTML = '<div class="spinner" style="margin-right: 6px;"></div> Optimising Route...';
-        showStatus(`Downloading ${exerciseMode} network & solving orienteering TSP...`, "info");
+
+        // Larger budgets take longer (bigger graph download + more cells).
+        // Scale timeout accordingly, with a 180 s cap.
+        const timeoutSecs = Math.min(30 + budgetKm * 3, 180);
+        showStatus(`Downloading ${exerciseMode} network & solving orienteering TSP... (timeout ${timeoutSecs}s)`, "info");
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutSecs * 1000);
 
         try {
             const response = await fetch("/api/plan", {
@@ -985,8 +1058,11 @@ def get_ui_html() -> str:
                     budget_km: budgetKm,
                     loop: isLoop,
                     exercise_type: exerciseMode
-                })
+                }),
+                signal: controller.signal
             });
+
+            clearTimeout(timeoutId);
 
             const result = await response.json();
 
@@ -997,7 +1073,11 @@ def get_ui_html() -> str:
             hideStatus();
             displayRouteResult(result);
         } catch (err) {
-            showStatus("Route Planning Error: " + err.message, "error");
+            if (err.name === "AbortError") {
+                showStatus(`Route planning timed out after ${timeoutSecs}s. Try a smaller distance or a start location closer to your targets.`, "error");
+            } else {
+                showStatus("Route Planning Error: " + err.message, "error");
+            }
         } finally {
             planBtn.disabled = false;
             planBtn.innerHTML = '<i class="fa-solid fa-route"></i> Plan Optimal Route';
@@ -1187,7 +1267,15 @@ class HexrouteRequestHandler(BaseHTTPRequestHandler):
                 cfg = load_config()
                 res_level = int(cfg["general"]["h3_resolution"])
                 targets = load_targets_csv("data/targets.csv")
-                scored = score_targets(targets, scoring_config=cfg.get("scoring"))
+
+                # Deduce our territory from ingested activities
+                d_dir = cfg["paths"]["data_dir"]
+                c_dir = cfg["paths"]["cache_dir"]
+                ingest_result = ingest_activities(data_dir=d_dir, cache_dir=c_dir)
+                coverage_data = compute_coverage(ingest_result.activities, res=res_level) if ingest_result.activities else {}
+                our_territory = set(coverage_data.keys())
+
+                scored = score_targets(targets, our_territory=our_territory, scoring_config=cfg.get("scoring"))
 
                 target_list = []
                 for cell, t in scored.items():
@@ -1201,6 +1289,44 @@ class HexrouteRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"targets": target_list})
             except Exception as e:
                 self._send_json({"targets": [], "error": str(e)})
+            return
+
+        if path == "/api/coverage":
+            try:
+                cfg = load_config()
+                res_level = int(cfg["general"]["h3_resolution"])
+                d_dir = cfg["paths"]["data_dir"]
+                c_dir = cfg["paths"]["cache_dir"]
+                ingest_result = ingest_activities(data_dir=d_dir, cache_dir=c_dir)
+
+                if not ingest_result.activities:
+                    self._send_json({"coverage": [], "track_count": 0})
+                    return
+
+                coverage_data = compute_coverage(ingest_result.activities, res=res_level)
+                coverage_list = []
+                for cell, rec in coverage_data.items():
+                    boundary = cell_to_boundary(cell)
+                    coverage_list.append({
+                        "id": cell,
+                        "visit_count": rec.visit_count,
+                        "boundary": [[p[0], p[1]] for p in boundary],
+                    })
+
+                # Also include raw track coordinates for display
+                tracks = []
+                for act_id, points in ingest_result.activities.items():
+                    if len(points) < 2:
+                        continue
+                    tracks.append({
+                        "id": act_id,
+                        "coords": [[p.lat, p.lng] for p in points],
+                        "point_count": len(points),
+                    })
+
+                self._send_json({"coverage": coverage_list, "tracks": tracks, "track_count": len(tracks)})
+            except Exception as e:
+                self._send_json({"coverage": [], "tracks": [], "track_count": 0, "error": str(e)})
             return
 
         if path == "/api/download-gpx":
@@ -1280,8 +1406,24 @@ class HexrouteRequestHandler(BaseHTTPRequestHandler):
                 )
                 scored = score_targets(expanded, scoring_config=cfg.get("scoring"))
 
+                # Deduce our territory from ingested activities so the
+                # optimiser knows which hexes we already own.
+                d_dir = cfg["paths"]["data_dir"]
+                c_dir = cfg["paths"]["cache_dir"]
+                ingest_result = ingest_activities(data_dir=d_dir, cache_dir=c_dir)
+                if ingest_result.activities:
+                    coverage_data = compute_coverage(ingest_result.activities, res=res_level)
+                    our_territory = set(coverage_data.keys())
+                    scored = score_targets(expanded, our_territory=our_territory, scoring_config=cfg.get("scoring"))
+
                 # Download/load OSM network
-                graph_radius_m = max((budget_km * 1000.0) / 2.0, 2500.0)
+                # Cap graph radius at 10 km — the optimiser only considers
+                # MAX_TARGET_CELLS (25) cells near the start, so a smaller
+                # graph keeps download and Dijkstra times manageable while
+                # still covering the local area.  Larger budgets benefit
+                # from a wider search area but the graph size scales as
+                # radius squared, making 25 km+ downloads take minutes.
+                graph_radius_m = max(min(budget_km * 1000.0 / 2.0, 10000.0), 2500.0)
                 graph = get_walking_graph(
                     lat=start_lat,
                     lng=start_lng,

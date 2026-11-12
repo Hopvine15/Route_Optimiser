@@ -105,6 +105,31 @@ def get_nearest_node(graph: nx.MultiDiGraph, lat: float, lng: float) -> int:
         return int(best_node) if best_node is not None else 0
 
 
+def get_nearest_nodes_batch(
+    graph: nx.MultiDiGraph,
+    coords: list[tuple[float, float]],
+) -> list[int]:
+    """Find nearest graph nodes for multiple (lat, lng) pairs in a single call.
+
+    osmnx.nearest_nodes builds a scipy k-d tree internally; calling it once
+    with arrays is far cheaper than calling it N times individually.
+    """
+    if "crs" not in graph.graph:
+        graph.graph["crs"] = "epsg:4326"
+    if not coords:
+        return []
+    lats = [c[0] for c in coords]
+    lngs = [c[1] for c in coords]
+    try:
+        nodes = ox.distance.nearest_nodes(graph, X=lngs, Y=lats)
+        # nearest_nodes returns a list when given lists
+        if isinstance(nodes, list):
+            return [int(n) for n in nodes]
+        return [int(nodes)]
+    except Exception:
+        return [get_nearest_node(graph, lat, lng) for lat, lng in coords]
+
+
 def get_node_coords(graph: nx.MultiDiGraph, node: int) -> tuple[float, float]:
     """Return (lat, lng) for a given graph node."""
     data = graph.nodes[node]

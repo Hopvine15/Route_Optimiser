@@ -554,8 +554,10 @@ def plan(
     scored_targets = score_targets(expanded_targets, scoring_config=cfg.get("scoring"))
 
     # Download or load OSM network
-    # Radius is set to half the budget or at least 2.5 km
-    graph_radius_m = max((budget_km * 1000.0) / 2.0, 2500.0)
+    # Cap graph radius at 10 km — the optimiser only considers the top
+    # MAX_TARGET_CELLS nearest cells, so a smaller graph keeps download
+    # and Dijkstra times manageable while still covering the local area.
+    graph_radius_m = max(min(budget_km * 1000.0 / 2.0, 10000.0), 2500.0)
     network_type = "bike" if mode.lower() in ("bike", "cycling", "cycle") else "walk"
     typer.echo(f"Loading OpenStreetMap {network_type} network...")
     graph = get_walking_graph(
