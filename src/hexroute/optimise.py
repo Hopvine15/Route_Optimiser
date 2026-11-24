@@ -5,11 +5,16 @@ import logging
 from typing import Sequence
 import networkx as nx
 
-from hexroute.graph import get_nearest_node, get_node_coords, index_graph_cells
+from hexroute.graph import get_nearest_node, get_nearest_nodes_batch, get_node_coords, index_graph_cells
 from hexroute.grid import cell_to_latlng, latlng_to_cell
 from hexroute.targets import HexStatus, ScoredHex
 
 logger = logging.getLogger("hexroute.optimise")
+
+# Maximum number of target cells considered by the optimiser.
+# Cells beyond this are pruned (lowest-scored first) to keep the
+# O(T²) greedy-insertion loop tractable for large budgets.
+MAX_TARGET_CELLS = 25
 
 
 @dataclass
@@ -33,14 +38,41 @@ class DistanceMatrix:
         self._dist_cache: dict[tuple[int, int], float] = {}
         self._path_cache: dict[tuple[int, int], list[int]] = {}
 
+    def precompute_distances(self, source_nodes: set[int]) -> None:
+        """Pre-compute shortest-path distances *between* the given nodes only.
+
+        Runs one Dijkstra per source node but stores results only for
+        targets that are also in source_nodes, keeping the cache small
+        (O(N²) entries instead of O(N × |V|)).
+        """
+        targets = frozenset(source_nodes)
+        for src in source_nodes:
+            try:
+                lengths = nx.single_source_dijkstra_path_length(self.graph, src, weight="length")
+                for tgt in targets:
+                    if tgt in lengths:
+                        self._dist_cache[(src, tgt)] = float(lengths[tgt])
+            except Exception:
+                pass
+
     def get_dist_and_path(self, u: int, v: int) -> tuple[float, list[int]]:
         if u == v:
             return 0.0, [u]
 
         pair = (u, v)
         if pair in self._dist_cache:
-            return self._dist_cache[pair], self._path_cache[pair]
+            dist = self._dist_cache[pair]
+            if pair in self._path_cache:
+                return dist, self._path_cache[pair]
+            # Distance is known but path isn't — compute just the path
+            try:
+                path = nx.shortest_path(self.graph, source=u, target=v, weight="length")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                path = []
+            self._path_cache[pair] = path
+            return dist, path
 
+        # Neither distance nor path is cached
         try:
             path = nx.shortest_path(self.graph, source=u, target=v, weight="length")
             dist = float(nx.shortest_path_length(self.graph, source=u, target=v, weight="length"))
@@ -80,8 +112,70 @@ def compute_tour_distance(waypoints: Sequence[int], matrix: DistanceMatrix, is_l
     return total
 
 
+def _insertion_cost(
+    tour: list[int],
+    pos: int,
+    node: int,
+    matrix: DistanceMatrix,
+    is_loop: bool,
+) -> float:
+    """
+    Compute the *marginal* distance change of inserting ``node`` at ``pos``
+    in ``tour``, without recalculating the entire tour distance.
+
+    Returns the delta (new total minus old total), or ``inf`` if any segment
+    is unreachable.  This is O(1) with cached lookups instead of O(n).
+    """
+    n = len(tour)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        # Only one node in tour — just measure to/from it
+        d = matrix.get_distance(tour[0], node)
+        if is_loop:
+            d += matrix.get_distance(node, tour[0])
+        return d
+
+    if pos >= n:
+        # Append at end
+        d_new = matrix.get_distance(tour[n - 1], node)
+        if is_loop:
+            d_new += matrix.get_distance(node, tour[0])
+            d_old = matrix.get_distance(tour[n - 1], tour[0])
+        else:
+            d_old = 0.0
+        return d_new - d_old
+    elif pos == 0:
+        # Prepend at start (unusual but handle it)
+        d_new = matrix.get_distance(node, tour[0])
+        return d_new
+    else:
+        # Insert between tour[pos-1] and tour[pos]
+        d_old = matrix.get_distance(tour[pos - 1], tour[pos])
+        d_new1 = matrix.get_distance(tour[pos - 1], node)
+        d_new2 = matrix.get_distance(node, tour[pos])
+        delta = d_new1 + d_new2 - d_old
+        return delta
+
+
+def _tour_delta(
+    tour: list[int],
+    pos: int,
+    node: int,
+    matrix: DistanceMatrix,
+    is_loop: bool,
+) -> float:
+    """Alias for _insertion_cost for readability."""
+    return _insertion_cost(tour, pos, node, matrix, is_loop)
+
+
 def two_opt_tour(waypoints: list[int], matrix: DistanceMatrix, is_loop: bool) -> list[int]:
-    """Apply 2-opt local search to reduce tour distance without changing visited nodes."""
+    """Apply 2-opt local search to reduce tour distance without changing visited nodes.
+
+    Uses incremental edge-swap delta instead of full tour recomputation:
+    reversing segment [i, k] only changes two edges (the ones at the cut points),
+    so we compare d(a,c)+d(b,d) vs d(a,b)+d(c,d) with O(1) cached lookups.
+    """
     if len(waypoints) <= 3:
         return waypoints
 
@@ -94,13 +188,19 @@ def two_opt_tour(waypoints: list[int], matrix: DistanceMatrix, is_loop: bool) ->
         n = len(best_tour)
         end_idx = n if is_loop else n - 1
         for i in range(1, end_idx - 1):
+            a = best_tour[i - 1]
+            b = best_tour[i]
             for k in range(i + 1, end_idx):
-                new_tour = best_tour[:i] + best_tour[i : k + 1][::-1] + best_tour[k + 1 :]
-                new_dist = compute_tour_distance(new_tour, matrix, is_loop)
+                c = best_tour[k]
+                d = best_tour[k + 1] if (k + 1) < n else best_tour[0]
 
-                if new_dist < best_dist - 0.5:
-                    best_tour = new_tour
-                    best_dist = new_dist
+                # Old edges: (a,b) and (c,d).  New edges after reversal: (a,c) and (b,d)
+                d_old = matrix.get_distance(a, b) + matrix.get_distance(c, d)
+                d_new = matrix.get_distance(a, c) + matrix.get_distance(b, d)
+
+                if d_new < d_old - 0.5:
+                    best_tour = best_tour[:i] + best_tour[i : k + 1][::-1] + best_tour[k + 1 :]
+                    best_dist = best_dist - d_old + d_new
                     improved = True
                     break
             if improved:
@@ -129,38 +229,99 @@ def plan_optimal_route(
     matrix = DistanceMatrix(graph)
     node_cells, edge_cells = index_graph_cells(graph, res=res)
 
+    # Pre-build reverse index: cell -> [node_ids] for O(1) lookup
+    # (avoids scanning all 300K+ graph nodes for each target cell)
+    cell_to_nodes: dict[str, list[int]] = {}
+    for node, cell in node_cells.items():
+        cell_to_nodes.setdefault(cell, []).append(node)
+
     # 1. Map each target cell with positive score to high-quality candidate nodes
     # Prioritise nodes with degree >= 2 (through-streets and intersections) to prevent dead-end spurs
     cell_candidates: dict[str, list[int]] = {}
 
-    for cell, target in scored_targets.items():
-        if target.final_score <= 0.0:
-            continue
+    # Pre-sort by score descending so we process highest-value cells first
+    # and can bail early once we've found MAX_TARGET_CELLS reachable ones.
+    ranked_targets = sorted(
+        ((cell, target) for cell, target in scored_targets.items() if target.final_score > 0.0),
+        key=lambda kv: kv[1].final_score,
+        reverse=True,
+    )
 
-        c_lat, c_lng = target.center_lat, target.center_lng
-        c_node = get_nearest_node(graph, c_lat, c_lng)
+    # Single-source shortest-path lengths from start_node (one Dijkstra instead of N)
+    start_dists_out: dict[int, float] | None = None
+    start_dists_back: dict[int, float] | None = None
 
-        # Quick reachability filter from start node
-        d_out = matrix.get_distance(start_node, c_node)
+    # Batch-resolve nearest graph nodes for all target coords at once.
+    # osmnx.nearest_nodes rebuilds a k-d tree on every call, so batching
+    # turns N tree-builds into 1.  Limit to a reasonable multiple of
+    # MAX_TARGET_CELLS since many will be filtered by reachability.
+    _batch_limit = MAX_TARGET_CELLS * 3
+    batch_targets = ranked_targets[:_batch_limit]
+    batch_coords = [(t.center_lat, t.center_lng) for _, t in batch_targets]
+    batch_nodes = get_nearest_nodes_batch(graph, batch_coords) if batch_coords else []
+
+    for idx, (cell, target) in enumerate(ranked_targets):
+        if len(cell_candidates) >= MAX_TARGET_CELLS:
+            logger.info(
+                "Capped target cells at %d (scored target: %.1f). Skipping remaining %d cells.",
+                MAX_TARGET_CELLS,
+                target.final_score,
+                len(ranked_targets) - len(cell_candidates),
+            )
+            break
+
+        c_node = batch_nodes[idx]
+
+        # Quick reachability filter from start node (uses cached single-source Dijkstra)
+        if start_dists_out is None:
+            try:
+                start_dists_out = dict(nx.single_source_dijkstra_path_length(graph, start_node, weight="length"))
+            except Exception:
+                start_dists_out = {}
+        d_out = start_dists_out.get(c_node, float("inf"))
         if d_out == float("inf"):
             continue
-        d_back = matrix.get_distance(c_node, start_node) if is_loop else 0.0
+
+        if is_loop:
+            if start_dists_back is None:
+                try:
+                    start_dists_back = dict(nx.single_source_dijkstra_path_length(graph, start_node, weight="length"))
+                except Exception:
+                    start_dists_back = {}
+            d_back = start_dists_back.get(c_node, float("inf"))
+        else:
+            d_back = 0.0
         if d_out + d_back > budget_m:
             continue
 
-        nodes_in_cell = [n for n, c in node_cells.items() if c == cell]
+        # O(1) lookup via pre-built reverse index instead of scanning all nodes
+        nodes_in_cell = cell_to_nodes.get(cell, [])
         if not nodes_in_cell:
             cell_candidates[cell] = [c_node]
             continue
 
         through_nodes = [n for n in nodes_in_cell if graph.degree(n) >= 2]
-        candidates = through_nodes[:6] if through_nodes else [c_node]
-        if c_node not in candidates:
-            candidates.append(c_node)
+        candidates = [c_node]  # just use the nearest node — simplest, 1 candidate per cell
+        # If a through-node is available, prefer it (avoids cul-de-sac dead ends)
+        if through_nodes:
+            candidates = [through_nodes[0]]
 
         cell_candidates[cell] = candidates
 
     # 2. Greedy construction with through-node insertion
+    # Pre-compute pairwise shortest-path distances among all candidate nodes
+    # so the greedy loop only does O(1) dict lookups.  Each unique source node
+    # needs one Dijkstra run; results are stored only for candidate targets
+    # to keep the cache small.
+    all_candidate_nodes: set[int] = {start_node}
+    for cands in cell_candidates.values():
+        all_candidate_nodes.update(cands)
+    logger.info(
+        "Pre-computing distances from %d unique candidate nodes...",
+        len(all_candidate_nodes),
+    )
+    matrix.precompute_distances(all_candidate_nodes)
+
     tour_nodes = [start_node]
     unvisited_cells = set(cell_candidates.keys())
     claimed_target_cells: set[str] = set()
@@ -184,12 +345,16 @@ def plan_optimal_route(
 
             for pos in range(1, len(tour_nodes) + 1):
                 for node in cands:
-                    temp_tour = tour_nodes[:pos] + [node] + tour_nodes[pos:]
-                    cand_dist = compute_tour_distance(temp_tour, matrix, is_loop)
+                    # Incremental cost: O(1) cached lookups instead of
+                    # recalculating the entire tour distance.
+                    delta = _tour_delta(tour_nodes, pos, node, matrix, is_loop)
+                    if delta == float("inf"):
+                        continue
+                    cand_dist = current_dist + delta
 
                     if cand_dist <= budget_m:
-                        delta_dist = max(cand_dist - current_dist, 1.0)
-                        ratio = score / delta_dist
+                        safe_delta = max(delta, 1.0)
+                        ratio = score / safe_delta
 
                         if ratio > best_ratio:
                             best_ratio = ratio
@@ -215,17 +380,19 @@ def plan_optimal_route(
         cands = cell_candidates[cell]
         best_pos = -1
         best_node = -1
-        best_dist = float("inf")
+        best_delta = float("inf")
 
         current_dist = compute_tour_distance(tour_nodes, matrix, is_loop)
 
         for pos in range(1, len(tour_nodes) + 1):
             for node in cands:
-                temp_tour = tour_nodes[:pos] + [node] + tour_nodes[pos:]
-                cand_dist = compute_tour_distance(temp_tour, matrix, is_loop)
+                delta = _tour_delta(tour_nodes, pos, node, matrix, is_loop)
+                if delta == float("inf"):
+                    continue
+                cand_dist = current_dist + delta
 
-                if cand_dist <= budget_m and cand_dist < best_dist:
-                    best_dist = cand_dist
+                if cand_dist <= budget_m and delta < best_delta:
+                    best_delta = delta
                     best_pos = pos
                     best_node = node
 
@@ -233,7 +400,9 @@ def plan_optimal_route(
             tour_nodes.insert(best_pos, best_node)
             unvisited_cells.remove(cell)
             claimed_target_cells.add(cell)
-            tour_nodes = two_opt_tour(tour_nodes, matrix, is_loop)
+
+    # Run 2-opt once after all secondary insertions (not per-cell)
+    tour_nodes = two_opt_tour(tour_nodes, matrix, is_loop)
 
     # 5. Construct complete path on graph
     full_path: list[int] = []

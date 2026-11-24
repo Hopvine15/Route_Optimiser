@@ -274,7 +274,9 @@ def ingest_activities(
 
     if not force_rebuild:
         cached = load_cached_ingest(c_dir)
-        if cached is not None:
+        # Only use cache if it actually found files; a cache from an
+        # empty-data-dir run would have total_files=0 and hide new files.
+        if cached is not None and cached.total_files > 0:
             return cached
 
     d_dir.mkdir(parents=True, exist_ok=True)
